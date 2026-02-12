@@ -1,6 +1,9 @@
-*.cfg
-__pycache__
-.github
-env
-# exclude
-!.gitkeep
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+data/
+postgres_data/
+*.db
+*.log
