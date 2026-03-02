@@ -20,9 +20,10 @@ from netmiko import ConnectHandler
 from flask import Flask, Response, render_template, request, send_from_directory
 
 
-PROVISIONING_API_URL = os.getenv("PROVISIONING_API_URL", "http://localhost:8000")
+#PROVISIONING_API_URL = os.getenv("PROVISIONING_API_URL", "http://localhost:8000")
+PROVISIONING_API_URL = os.getenv("PROVISIONING_API_URL", "http://provisioning_api:8000")
 ENABLE_SSH_COMPLIANCE = os.getenv("ENABLE_SSH_COMPLIANCE", "0") == "1"
-
+HTTP_SERVER = os.getenv("HTTP_SERVER", "10.1.12.89:8080")
 SSH_USER = os.getenv("SWITCH_SSH_USER", "")
 SSH_PASS = os.getenv("SWITCH_SSH_PASS", "")
 SSH_SECRET = os.getenv("SWITCH_SSH_SECRET", "")
@@ -134,16 +135,16 @@ def poll_ssh_and_report(serial: str, ip: str):
 
 def notify_api_config_applied(serial):
     try:
+        url = f"{PROVISIONING_API_URL}/switches/config-applied"
         res = requests.post(
-            "http://provisioning_api:8000/switches/config-applied",
+            url,
             data={"serial_number": serial},
             timeout=5
         )
         print("Notification API:", res.text)
     except Exception as e:
         print("Error notificando API:", e)
-
-
+        
 # disable default Flask logging to stdout
 logging.getLogger("werkzeug").disabled = True
 flask.cli.show_server_banner = lambda *args: None
@@ -185,7 +186,9 @@ else:
 LOCAL_PORT = str(args.port)
 
 # build var from args or local values/defaults
-HTTP_SERVER = LOCAL_IP + ":" + LOCAL_PORT
+#HTTP_SERVER = LOCAL_IP + ":" + LOCAL_PORT
+BIND_IP = "0.0.0.0"
+BIND_PORT = int(os.getenv("PORT", "8080"))
 
 
 # we are ready
@@ -290,7 +293,7 @@ def pnp_work_request():
 
     serial_number = udi_match.group("serial_number")
     ip = request.remote_addr
-    notify_api_report_ip(serial, ip)
+    notify_api_report_ip(serial_number, ip)
 
     try:
         config_file = serial_number
@@ -422,4 +425,4 @@ def pnp_work_response():
     return Response(result_data, mimetype="text/xml")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=LOCAL_PORT)
+    app.run(host="0.0.0.0", port=8080)
