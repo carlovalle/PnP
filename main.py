@@ -36,6 +36,11 @@ IOS_VERSION_RE = re.compile(r"Version\s+([\w\.\(\)\-]+)")
 IOS_MODEL_RE_1 = re.compile(r"[Mm]odel\s+[Nn]umber\s*:\s*(\S+)")
 IOS_MODEL_RE_2 = re.compile(r"[Cc]isco\s+(\S+)\s+\(")  # ejemplo: "cisco C9300-24T (X86)..."
 
+#auto upgrade variables
+AUTO_UPGRADE_ENABLED = os.getenv("AUTO_UPGRADE_ENABLED", "0") == "1"
+AUTO_UPGRADE_DRY_RUN = os.getenv("AUTO_UPGRADE_DRY_RUN", "1") == "1"
+IMAGE_INSTALL_TIMEOUT = int(os.getenv("IMAGE_INSTALL_TIMEOUT", "3600"))
+MIN_FREE_SPACE_BYTES = int(os.getenv("MIN_FREE_SPACE_BYTES", "1200000000"))
 
 def get_ips_from_api(serial: str):
     try:
@@ -47,6 +52,21 @@ def get_ips_from_api(serial: str):
         print(f"[IP-LOOKUP] Failed to get IPs for {serial}: {e}")
         return {}
 
+def get_switch_record(serial: str):
+    try:
+        url = f"{PROVISIONING_API_URL}/switches"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+
+        rows = r.json()
+        for row in rows:
+            if row.get("serial_number") == serial:
+                return row
+
+        return None
+    except Exception as e:
+        print(f"[SWITCH-LOOKUP] Failed for {serial}: {e}")
+        return None
 
 def parse_show_version(output: str):
     version = None
@@ -132,6 +152,186 @@ def poll_ssh_and_report(serial: str, ip: str):
             print(f"[SSH] attempt {attempt}/{SSH_RETRIES} failed for {serial}@{ip}: {e}")
             time.sleep(SSH_RETRY_SLEEP)
     raise RuntimeError(f"SSH poll failed after {SSH_RETRIES} attempts: {last_err}")
+
+def get_upgrade_plan(serial: str):
+    try:
+        url = f"{PROVISIONING_API_URL}/switches/{serial}/upgrade-plan"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[UPGRADE-PLAN] {serial} unavailable: {r.status_code} {r.text}")
+        return None
+    except Exception as e:
+        print(f"[UPGRADE-PLAN] Failed for {serial}: {e}")
+        return None
+
+
+def open_ssh_connection(host: str):
+    if not SSH_USER or not SSH_PASS:
+        raise RuntimeError("Missing SWITCH_SSH_USER/SWITCH_SSH_PASS env vars")
+
+    device = {
+        "device_type": SSH_DEVICE_TYPE,
+        "host": host,
+        "username": SSH_USER,
+        "password": SSH_PASS,
+        "secret": SSH_SECRET or None,
+        "timeout": SSH_TIMEOUT,
+        "conn_timeout": SSH_TIMEOUT,
+        "banner_timeout": SSH_TIMEOUT,
+        "auth_timeout": SSH_TIMEOUT,
+        "fast_cli": False,
+    }
+
+    conn = ConnectHandler(**device)
+    if SSH_SECRET:
+        conn.enable()
+    return conn
+
+
+def is_install_mode(conn) -> bool:
+    out = conn.send_command(
+        "show version | include INSTALL|BUNDLE",
+        read_timeout=60
+    )
+    up = out.upper()
+    print(f"[UPGRADE] show version install/bundle output: {out}")
+    return "INSTALL" in up and "BUNDLE" not in up
+
+
+def get_free_space_bytes(conn) -> int:
+    out = conn.send_command("dir flash:", read_timeout=120)
+    print(f"[UPGRADE] dir flash output:\n{out}")
+
+    m = re.search(r"(\d+)\s+bytes free", out, re.IGNORECASE)
+    if not m:
+        raise RuntimeError("Could not parse free space from 'dir flash:'")
+
+    return int(m.group(1))
+
+
+def validate_upgrade_readiness(host: str, image_url: str):
+    conn = open_ssh_connection(host)
+    try:
+        install_mode = is_install_mode(conn)
+        free_bytes = get_free_space_bytes(conn)
+
+        result = {
+            "install_mode": install_mode,
+            "free_bytes": free_bytes,
+            "enough_space": free_bytes >= MIN_FREE_SPACE_BYTES,
+            "image_url": image_url,
+        }
+
+        print(
+            f"[UPGRADE-DRYRUN] host={host} "
+            f"install_mode={install_mode} "
+            f"free_bytes={free_bytes} "
+            f"enough_space={result['enough_space']} "
+            f"image_url={image_url}"
+        )
+
+        return result
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+
+def run_install_upgrade(host: str, image_url: str):
+    conn = open_ssh_connection(host)
+    try:
+        if not is_install_mode(conn):
+            raise RuntimeError("Switch is not in INSTALL mode")
+
+        free_bytes = get_free_space_bytes(conn)
+        print(f"[UPGRADE] free space on {host}: {free_bytes} bytes")
+
+        if free_bytes < MIN_FREE_SPACE_BYTES:
+            raise RuntimeError(
+                f"Not enough free space on flash: {free_bytes} bytes "
+                f"(required >= {MIN_FREE_SPACE_BYTES})"
+            )
+
+        print(f"[UPGRADE] saving config on {host} before install")
+        save_out = conn.send_command(
+            "write memory",
+            read_timeout=180,
+            expect_string=r"#",
+            strip_prompt=False,
+            strip_command=False,
+        )
+        print("[UPGRADE] write memory output:")
+        print(save_out)
+
+        cmd = f"install add file {image_url} activate commit prompt-level none"
+        print(f"[UPGRADE] running on {host}: {cmd}")
+
+        out = conn.send_command(
+            cmd,
+            read_timeout=IMAGE_INSTALL_TIMEOUT,
+            expect_string=r"#",
+            strip_prompt=False,
+            strip_command=False,
+        )
+        print("[UPGRADE] install output:")
+        print(out)
+        return out
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+
+def maybe_run_upgrade(serial: str, mgmt_ip: str | None, compliance_result: dict | None):
+    if not AUTO_UPGRADE_ENABLED:
+        print(f"[UPGRADE] auto upgrade disabled for {serial}")
+        return
+
+    if not mgmt_ip or not compliance_result:
+        return
+
+    state = compliance_result.get("state")
+    if state != "non-compliant":
+        print(f"[UPGRADE] {serial} state={state}, no upgrade needed")
+        return
+
+    plan = get_upgrade_plan(serial)
+    if not plan:
+        return
+
+    image_url = plan.get("image_url")
+    if not image_url:
+        return
+
+    notify_api_set_state(serial, "upgrade-planned")
+
+    try:
+        if AUTO_UPGRADE_DRY_RUN:
+            result = validate_upgrade_readiness(mgmt_ip, image_url)
+            print(f"[UPGRADE-DRYRUN] validation result for {serial}: {result}")
+            return
+
+        notify_api_set_state(serial, "upgrading")
+        run_install_upgrade(mgmt_ip, image_url)
+        notify_api_set_state(serial, "upgrade-complete")
+    except Exception as e:
+        notify_api_set_state(serial, "upgrade-failed")
+        raise
+
+def notify_api_set_state(serial: str, state: str):
+    try:
+        url = f"{PROVISIONING_API_URL}/switches/set-state"
+        res = requests.post(
+            url,
+            data={"serial_number": serial, "state": state},
+            timeout=10
+        )
+        res.raise_for_status()
+    except Exception as e:
+        print(f"[STATE] Failed to set state={state} for {serial}: {e}")
 
 def notify_api_config_applied(serial):
     try:
@@ -241,7 +441,33 @@ def root():
 
 @app.route("/configs/<path:path>")
 def serve_configs(path):
-    return send_from_directory("configs", path)
+    try:
+        filename = os.path.basename(path)
+
+        # Solo aplica la lógica de bloqueo a archivos .cfg
+        if filename.lower().endswith(".cfg"):
+            serial = filename[:-4]  # quita ".cfg"
+
+            sw = get_switch_record(serial)
+            if sw:
+                state = sw.get("state")
+                print(f"[DAY0-GATE] serial={serial} state={state}")
+
+                # Bloquear Day-0 si el switch ya no lo necesita
+                blocked_states = {
+                    "compliant",
+                    "dayn-applied",
+                }
+
+                if state in blocked_states:
+                    print(f"[DAY0-GATE] Blocking Day-0 config for {serial} (state={state})")
+                    return Response("", status=404, mimetype="text/plain")
+
+        return send_from_directory("configs", path)
+
+    except Exception as e:
+        print(f"[DAY0-GATE] Error serving {path}: {e}")
+        return Response("Internal error", status=500, mimetype="text/plain")
 
 
 @app.route("/images/<path:path>")
@@ -409,6 +635,12 @@ def pnp_work_response():
                         f"current={result.get('current_version')} "
                         f"recommended={result.get('recommended_version')}"
                     )
+
+                    try:
+                        maybe_run_upgrade(serial, ip, result)
+                    except Exception as e:
+                        print(f"[UPGRADE] Failed for {serial} on {ip}: {e}")
+
                     break
                 except Exception as e:
                     last_err = e
@@ -423,6 +655,7 @@ def pnp_work_response():
     jinja_context = {"udi": udi, "correlator_id": correlator_id}
     result_data = render_template("bye.xml", **jinja_context)
     return Response(result_data, mimetype="text/xml")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
