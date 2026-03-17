@@ -333,6 +333,32 @@ def notify_api_set_state(serial: str, state: str):
     except Exception as e:
         print(f"[STATE] Failed to set state={state} for {serial}: {e}")
 
+def report_ip_on_work_request(serial: str, seen_ip: str):
+    try:
+        sw = get_switch_record(serial)
+        if not sw:
+            print(f"[WORK-REQUEST-IP] Switch {serial} not found in provisioning")
+            return
+
+        state = sw.get("state")
+        payload = {
+            "serial_number": serial,
+            "last_seen_ip": seen_ip,
+        }
+
+        # Actualiza mgmt_ip mientras el switch no haya terminado el proceso
+        # Ajusta esta lógica según tu estado final real
+        if state != "dayn-applied":
+            payload["mgmt_ip"] = seen_ip
+
+        url = f"{PROVISIONING_API_URL}/switches/report-ip"
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+
+        print(f"[WORK-REQUEST-IP] Updated {serial}: last_seen_ip={seen_ip}, state={state}")
+    except Exception as e:
+        print(f"[WORK-REQUEST-IP] Failed for {serial}: {e}")
+
 def notify_api_config_applied(serial):
     try:
         url = f"{PROVISIONING_API_URL}/switches/config-applied"
@@ -519,7 +545,7 @@ def pnp_work_request():
 
     serial_number = udi_match.group("serial_number")
     ip = request.remote_addr
-    notify_api_report_ip(serial_number, ip)
+    report_ip_on_work_request(serial_number, ip)
 
     try:
         config_file = serial_number
